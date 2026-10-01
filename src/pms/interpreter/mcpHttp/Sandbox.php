@@ -22,7 +22,8 @@ class Sandbox
     protected int|string|null $id = null;
     protected bool $modern = false;
     protected string $version = self::INITIALIZE_VERSION;
-    protected ?string $authenticator = null;
+    protected array $authMechanisms = [];
+    protected ?string $authenticationScheme = null;
     protected string $resource = '';
     protected string $metadataUri = '';
 
@@ -60,11 +61,7 @@ class Sandbox
                 $this->response->end();
                 return;
             }
-            $handler = config('mcp.auth.handler');
-            if (!is_string($handler) || !is_subclass_of($handler, McpAuthenticatorInterface::class)) {
-                throw new LogicException('mcp.auth.handler 需要实现 McpAuthenticatorInterface');
-            }
-            $this->authenticator = $handler;
+            $this->authMechanisms = $this->authenticationMechanisms();
             if ($match['metadata']) {
                 if (!$this->request->isGet()) {
                     $this->response->header('Allow', 'GET, OPTIONS');
@@ -75,11 +72,7 @@ class Sandbox
                 $this->json($metadata ?? ['error' => 'OAuth metadata unavailable'], $metadata === null ? 404 : 200);
                 return;
             }
-            $authentication = $handler::authenticate($this->request);
-            if (!in_array($authentication['scheme'] ?? '', ['oauth2', 'apiKey', 'noauth'], true)
-                || !is_array($authentication['context'] ?? null)) {
-                throw new LogicException('MCP 认证器需要返回 scheme 与 context');
-            }
+            $authentication = $this->authenticate();
             $this->request->setAttach('mcp_authentication', $authentication);
             $this->request->setAttach('authenticated_context', $authentication['context']);
             if (!$this->request->isPost()) {
@@ -177,8 +170,101 @@ class Sandbox
             $this->response->header('Vary', 'Origin');
         }
         $this->response->header('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
-        $this->response->header('Access-Control-Allow-Headers', 'Authorization, Content-Type, MCP-Protocol-Version, Mcp-Method, Mcp-Name');
+        $headers = ['Content-Type', 'MCP-Protocol-Version', 'Mcp-Method', 'Mcp-Name'];
+        foreach ((array)config('mcp.auth.mechanisms', []) as $mechanism) {
+            if (is_array($mechanism) && is_string($mechanism['header'] ?? null)) {
+                $headers[] = $mechanism['header'];
+            }
+        }
+        $this->response->header('Access-Control-Allow-Headers', implode(', ', array_unique($headers)));
         $this->response->header('Access-Control-Expose-Headers', 'WWW-Authenticate, MCP-Protocol-Version');
+    }
+
+
+    /**
+     * 读取认证机制配置，要求各凭据请求头唯一，公开认证单独登记。
+     *
+     * @return array<string, array>
+     */
+    protected function authenticationMechanisms(): array
+    {
+        $mechanisms = config('mcp.auth.mechanisms', []);
+        if (!is_array($mechanisms) || $mechanisms === []) {
+            throw new LogicException('mcp.auth.mechanisms 需要登记认证器');
+        }
+        $headers = [];
+        foreach ($mechanisms as $scheme => $mechanism) {
+            if (!in_array($scheme, ['oauth2', 'apiKey', 'noauth'], true) || !is_array($mechanism)) {
+                throw new LogicException('MCP 认证机制配置无效');
+            }
+            $handler = $mechanism['handler'] ?? null;
+            if (!is_string($handler) || !is_subclass_of($handler, McpAuthenticatorInterface::class)) {
+                throw new LogicException('MCP 认证器需要实现 McpAuthenticatorInterface');
+            }
+            if ($scheme === 'noauth') {
+                if (count($mechanisms) !== 1 || isset($mechanism['header'])) {
+                    throw new LogicException('noauth 需要单独登记且不设置凭据请求头');
+                }
+                continue;
+            }
+            $header = $mechanism['header'] ?? null;
+            if (!is_string($header) || preg_match("/^[A-Za-z0-9!#$%&'*+.^_`|~-]+$/D", $header) !== 1) {
+                throw new LogicException('MCP 认证机制需要有效的 header');
+            }
+            $header = strtolower($header);
+            if (isset($headers[$header])) {
+                throw new LogicException('MCP 认证凭据请求头重复：' . $header);
+            }
+            $headers[$header] = true;
+            $mechanisms[$scheme]['header'] = $header;
+        }
+        return $mechanisms;
+    }
+
+    /**
+     * 按凭据请求头选择一次认证，冲突和失败直接结束请求。
+     *
+     * @return array{scheme: string, context: array}
+     */
+    protected function authenticate(): array
+    {
+        $selected = [];
+        foreach ($this->authMechanisms as $scheme => $mechanism) {
+            if ($scheme === 'noauth' || $this->request->header($mechanism['header'], '') !== '') {
+                $selected[] = $scheme;
+            }
+        }
+        if (count($selected) > 1) {
+            throw new McpAuthenticationException('MCP 请求只能提交一种认证凭据', 400, 'invalid_request');
+        }
+        if ($selected === []) {
+            throw new McpAuthenticationException('需要 MCP 认证凭据');
+        }
+        $scheme = $selected[0];
+        $this->authenticationScheme = $scheme;
+        $mechanism = $this->authMechanisms[$scheme];
+        $this->request->setAttach('mcp_auth_scheme', $scheme);
+        $this->request->setAttach('mcp_auth_config', $mechanism);
+        $authentication = ($mechanism['handler'])::authenticate($this->request);
+        if (($authentication['scheme'] ?? null) !== $scheme || !is_array($authentication['context'] ?? null)) {
+            throw new LogicException('MCP 认证结果需要匹配配置的 scheme 并返回 context');
+        }
+        return $authentication;
+    }
+
+    /**
+     * 读取宿主静态说明及运行时说明。
+     */
+    protected function instructions(): string
+    {
+        $instructions = config('mcp.instructions', '');
+        if (is_callable($instructions)) {
+            $instructions = $instructions();
+        }
+        if (!is_string($instructions)) {
+            throw new LogicException('mcp.instructions 需要字符串及返回字符串的 callable');
+        }
+        return $instructions;
     }
 
     protected function protocol(string $method, stdClass $params): void
@@ -242,7 +328,7 @@ class Sandbox
         return [
             'supportedVersions' => [self::CURRENT_VERSION],
             'capabilities' => $this->capabilities(),
-            'instructions' => (string)config('mcp.instructions', ''),
+            'instructions' => $this->instructions(),
             'ttlMs' => 0,
             'cacheScope' => 'private',
         ];
@@ -263,7 +349,7 @@ class Sandbox
             'protocolVersion' => self::INITIALIZE_VERSION,
             'serverInfo' => $this->serverInfo(),
             'capabilities' => $this->capabilities(),
-            'instructions' => (string)config('mcp.instructions', ''),
+            'instructions' => $this->instructions(),
         ];
     }
 
@@ -303,7 +389,12 @@ class Sandbox
 
     protected function oauthMetadata(): ?array
     {
-        $handler = $this->authenticator;
+        $handler = $this->authMechanisms['oauth2']['handler'] ?? null;
+        if ($handler === null) {
+            return null;
+        }
+        $this->request->setAttach('mcp_auth_scheme', 'oauth2');
+        $this->request->setAttach('mcp_auth_config', $this->authMechanisms['oauth2']);
         $metadata = $handler::oauthMetadata($this->request);
         if ($metadata === null) {
             return null;
@@ -318,7 +409,7 @@ class Sandbox
     protected function authenticationError(McpAuthenticationException $e): void
     {
         $headers = $e->headers;
-        if ($this->authenticator !== null && in_array($e->httpStatus, [401, 403], true)
+        if ($this->authenticationScheme !== 'apiKey' && in_array($e->httpStatus, [401, 403], true)
             && !array_key_exists('www-authenticate', array_change_key_case($headers))) {
             try {
                 $metadata = $this->oauthMetadata();
@@ -333,6 +424,8 @@ class Sandbox
                     }
                     $headers['WWW-Authenticate'] = $challenge;
                 }
+            } catch (McpAuthenticationException $metadataError) {
+                error_log('[mcp-http metadata] ' . $metadataError);
             } catch (Throwable $metadataError) {
                 error_log('[mcp-http metadata] ' . $metadataError);
                 $this->json(['error' => 'server_error'], 500);
