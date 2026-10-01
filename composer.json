@@ -1,0 +1,35 @@
+{
+    "name": "superpms/interpreter-mcp-http",
+    "description": "PMS MCP HTTP interpreter package",
+    "type": "library",
+    "license": "Apache-2.0",
+    "autoload": {
+        "psr-4": {
+            "pms\\": "src/pms/"
+        },
+        "files": [
+            "bin/autoload.php"
+        ]
+    },
+    "authors": [
+        {
+            "name": "Guest",
+            "email": "kid666@88.com"
+        }
+    ],
+    "minimum-stability": "dev",
+    "prefer-stable": true,
+    "require": {
+        "php": ">=8.2",
+        "superpms/basic": "^1.0.0",
+        "superpms/interpreter-http": "^1.0.0",
+        "superpms/interpreter-terminal": "^1.0.0"
+    },
+    "extra": {
+        "pms": {
+            "config": {
+                "mcp": "resource/config.php"
+            }
+        }
+    }
+}
